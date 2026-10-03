@@ -54,6 +54,23 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
 GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
 
+#define GGML_METAL_ROCKETKV_COMPONENTS 14
+struct ggml_metal_rocketkv_profile_entry {
+    char name[32];
+    double gpu_ms;
+    uint64_t calls;
+};
+
+struct ggml_metal_rocketkv_profile {
+    struct ggml_metal_rocketkv_profile_entry entries[GGML_METAL_ROCKETKV_COMPONENTS];
+    uint32_t samples;
+};
+
+// Diagnostic pass timestamps. These calls synchronize only at the request boundaries.
+// Profiling splits encoders and disables fusion; do not use its wall time for speed claims.
+GGML_BACKEND_API bool ggml_backend_metal_rocketkv_profile_begin(ggml_backend_t backend);
+GGML_BACKEND_API bool ggml_backend_metal_rocketkv_profile_end(ggml_backend_t backend, struct ggml_metal_rocketkv_profile * result);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

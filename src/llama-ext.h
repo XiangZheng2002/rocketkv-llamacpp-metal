@@ -9,6 +9,30 @@
 #include <cstdint>
 #include <map>
 
+// Single-turn, batch-one RocketKV experiment. Enable on an empty context before prefill.
+struct llama_rocketkv_params {
+    int32_t prompt_tokens = 0;
+    int32_t decode_tokens = 32;
+    int32_t token_budget = 512;
+    int32_t observation_window = 32;
+    int32_t pooling_kernel = 63;
+};
+
+struct llama_rocketkv_info {
+    bool active = false;
+    int32_t prompt_kept = 0;
+    int32_t capacity = 0;
+    int32_t page_size = 0;
+    int32_t query_dims = 0;
+    int32_t attention_tokens = 0;
+    uint64_t allocated_kv_bytes = 0;
+    uint64_t auxiliary_bytes = 0;
+    uint64_t active_kv_bytes = 0;
+};
+
+LLAMA_API bool llama_rocketkv_init(llama_context * ctx, const llama_rocketkv_params & params);
+LLAMA_API llama_rocketkv_info llama_rocketkv_get_info(const llama_context * ctx);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

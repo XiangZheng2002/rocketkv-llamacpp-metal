@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-rocketkv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6801,6 +6802,58 @@ struct test_argsort : public test_case {
     }
 };
 
+struct test_rocketkv : public test_case {
+    const int kind;
+    const ggml_type type;
+    const int n;
+    ggml_tensor * live = nullptr;
+    ggml_tensor * sort_input = nullptr;
+
+    test_rocketkv(int kind, ggml_type type, int n = 31) : kind(kind), type(type), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR3(kind, type, n); }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (kind == GGML_ROCKETKV_REDUCE) {
+            return ggml_rocketkv_reduce(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 3, 6), 2, n - 3);
+        }
+        if (kind == GGML_ROCKETKV_TOP_K || kind == GGML_ROCKETKV_INDICES) {
+            sort_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 2);
+            auto * top = ggml_rocketkv_top_k(ctx, sort_input, std::min(17, n));
+            return kind == GGML_ROCKETKV_TOP_K ? top : ggml_rocketkv_indices(ctx, top, 3, n + 3);
+        }
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 6, 1);
+        auto * sums = ggml_rocketkv_query(ctx, q, 2);
+        if (kind == GGML_ROCKETKV_QUERY) {
+            return sums;
+        }
+        auto * k = ggml_new_tensor_3d(ctx, type, 128, 2, n);
+        auto * meta = ggml_new_tensor_3d(ctx, type, (n + 2)/3, 256, 2);
+        live = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        auto * updated = ggml_rocketkv_metadata(ctx, k, meta, live, 3, true);
+        if (kind == GGML_ROCKETKV_METADATA) {
+            return updated;
+        }
+        auto * dims = ggml_rocketkv_top_k(ctx, ggml_view_2d(ctx, sums, 128, 2, sums->nb[2], 0), 20);
+        return ggml_rocketkv_scores(ctx, q, updated, dims, sums, live, 3, n);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (live) {
+            ggml_backend_tensor_set(live, &n, 0, sizeof(n));
+        }
+        if (sort_input) {
+            std::vector<float> data(ggml_nelements(sort_input));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = int(i % 7) - 3;
+            }
+            ggml_backend_tensor_set(sort_input, data.data(), 0, ggml_nbytes(sort_input));
+        }
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9231,6 +9284,15 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    for (int kind = GGML_ROCKETKV_REDUCE; kind <= GGML_ROCKETKV_SCORES; ++kind) {
+        for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_rocketkv(kind, type));
+        }
+    }
+    for (int n : {1, 17, 128, 1025, 8192}) {
+        test_cases.emplace_back(new test_rocketkv(GGML_ROCKETKV_TOP_K, GGML_TYPE_F32, n));
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

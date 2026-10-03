@@ -336,6 +336,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h
+    include/ggml-rocketkv.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
     include/ggml-vulkan.h

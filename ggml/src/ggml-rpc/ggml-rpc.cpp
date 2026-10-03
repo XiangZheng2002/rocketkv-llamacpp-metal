@@ -1378,6 +1378,10 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
+    if (tensor->op == GGML_OP_ROCKETKV) {
+        GGML_LOG_ERROR("[%s] RocketKV is a local CPU/Metal operation and cannot be transported over RPC\n", __func__);
+        return nullptr;
+    }
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
@@ -2217,9 +2221,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results
-    return true;
+    return op->op != GGML_OP_ROCKETKV;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

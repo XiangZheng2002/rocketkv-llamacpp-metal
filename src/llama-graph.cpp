@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-rocketkv.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2907,10 +2908,15 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k;
-    ggml_tensor * v;
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
 
-    if (cparams.training) {
+    const bool rocket_active = cparams.rocketkv && cparams.rocketkv->info.active;
+    const bool rocket_decode = rocket_active && cparams.rocketkv->phase(ubatch) == 2;
+
+    if (rocket_decode) {
+        GGML_ASSERT(kq_b == nullptr && sinks == nullptr);
+    } else if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
         k = k_cur;
@@ -2930,7 +2936,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = rocket_decode ?
+        cparams.rocketkv->decode(ctx0, res, ubatch, q, k_cur, v_cur, kq_scale, il) :
+        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    if (rocket_active && !rocket_decode) {
+        cparams.rocketkv->prefill(ctx0, res, ubatch, q, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

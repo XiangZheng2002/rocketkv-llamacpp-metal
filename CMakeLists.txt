@@ -196,6 +196,9 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+license_add_file("RocketKV research prototype" "docs/rocketkv/LICENSE.NVIDIA")
+license_add_file("RocketKV attribution" "docs/rocketkv/NOTICE")
+install(FILES docs/rocketkv/LICENSE.NVIDIA docs/rocketkv/NOTICE DESTINATION share/licenses/llama.cpp/rocketkv)
 
 #
 # compile options

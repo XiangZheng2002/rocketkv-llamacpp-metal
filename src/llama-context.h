@@ -74,6 +74,9 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    bool init_rocketkv(const llama_rocketkv_params & params);
+    llama_rocketkv_info get_rocketkv_info() const;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -296,6 +299,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::unique_ptr<llama_rocketkv> rocketkv;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

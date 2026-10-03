@@ -1,0 +1,8 @@
+add_executable(llama-rocketkv rocketkv.cpp)
+target_include_directories(llama-rocketkv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(llama-rocketkv PRIVATE llama llama-common)
+target_compile_features(llama-rocketkv PRIVATE cxx_std_17)
+if (TARGET ggml-metal)
+    target_link_libraries(llama-rocketkv PRIVATE ggml-metal)
+    target_compile_definitions(llama-rocketkv PRIVATE ROCKETKV_METAL)
+endif()

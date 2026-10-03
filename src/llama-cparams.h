@@ -7,7 +7,10 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct llama_rocketkv;
+
 struct llama_cparams {
+    llama_rocketkv * rocketkv = nullptr;
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;

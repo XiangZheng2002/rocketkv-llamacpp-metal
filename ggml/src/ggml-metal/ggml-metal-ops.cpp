@@ -1,6 +1,7 @@
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
+#include "ggml-rocketkv.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -89,7 +90,7 @@ struct ggml_metal_op {
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
     // by the device (initialized from GGML_METAL_FUSION_DISABLE, overridable by the test)
     bool use_fusion() const {
-        return ggml_metal_fusion_info_enabled(finfo);
+        return !ggml_metal_device_rocketkv_profile_enabled(dev) && ggml_metal_fusion_info_enabled(finfo);
     }
 
     // record that a fusion fired, indexed by the matching table entry
@@ -283,6 +284,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_CONCAT:
             {
                 n_fuse = ggml_metal_op_concat(ctx, idx);
+            } break;
+        case GGML_OP_ROCKETKV:
+            {
+                n_fuse = ggml_metal_op_rocketkv(ctx, idx);
             } break;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -536,6 +541,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    const bool profiled = ggml_metal_encoder_rocketkv_profile_begin(ctx->enc, ctx->dev, ctx->node(idx)->name);
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -548,6 +554,10 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
 
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
+    }
+
+    if (profiled) {
+        ggml_metal_encoder_rocketkv_profile_end(ctx->enc);
     }
 
     return res;
@@ -5823,6 +5833,68 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
+    return 1;
+}
+
+int ggml_metal_op_rocketkv(ggml_metal_op_t ctx, int idx) {
+    const auto * op = ctx->node(idx);
+    const auto * a = op->src[0];
+    const auto * b = op->src[1];
+    const auto * c = op->src[2];
+    const int kind = op->op_params[0];
+    const bool f16 = kind == GGML_ROCKETKV_METADATA ? op->type == GGML_TYPE_F16 :
+                    kind == GGML_ROCKETKV_SCORES && b->type == GGML_TYPE_F16;
+    ggml_metal_kargs_rocketkv args = {
+        op->op_params[1], op->op_params[2], f16,
+        int32_t(op->ne[0]), int32_t(op->ne[1]), int32_t(op->ne[2]),
+        int32_t(a->ne[0]), int32_t(a->ne[1]), int32_t(a->ne[2]),
+        b ? int32_t(b->ne[0]) : 0, b ? int32_t(b->ne[1]) : 0, b ? int32_t(b->ne[2]) : 0,
+        c ? int32_t(c->ne[0]) : 0,
+        a->nb[0], a->nb[1], a->nb[2],
+    };
+    const char * names[] = {"reduce", "top_k", "indices", "metadata", "query", "scores"};
+    GGML_ASSERT(kind >= 0 && kind < 6);
+    char name[64];
+    snprintf(name, sizeof(name), "kernel_rocketkv_%s", names[kind]);
+    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
+    }
+    auto enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    for (int i = 0; i < 5; ++i) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i] ? op->src[i] : op), i + 1);
+    }
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
+    int count = 0;
+    switch (kind) {
+        case GGML_ROCKETKV_TOP_K: {
+            int padded = 1;
+            while (padded < args.a0) {
+                padded *= 2;
+            }
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(padded*sizeof(int32_t), 16), 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.n1, 1, 1, std::min(256, padded), 1, 1);
+            return 1;
+        }
+        case GGML_ROCKETKV_INDICES:
+            ggml_metal_encoder_dispatch_threadgroups(enc, (args.n0 + 255)/256, args.n1, 1, 256, 1, 1);
+            return 1;
+        case GGML_ROCKETKV_REDUCE:
+            count = args.n0*args.n1;
+            break;
+        case GGML_ROCKETKV_METADATA:
+            count = args.a0*args.a1*(args.p2 ? args.n0 : 1);
+            break;
+        case GGML_ROCKETKV_QUERY:
+            count = args.n0*args.n2;
+            break;
+        case GGML_ROCKETKV_SCORES:
+            count = args.b0*args.a1;
+            break;
+    }
+    ggml_metal_encoder_dispatch_threadgroups(enc, (count + 255)/256, 1, 1, 256, 1, 1);
     return 1;
 }
 

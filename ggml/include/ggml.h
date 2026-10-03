@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ROCKETKV,
+
         GGML_OP_COUNT,
     };
 

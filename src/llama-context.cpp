@@ -11,6 +11,8 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-rocketkv.h"
+#include "llama-kv-cache.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -478,6 +480,28 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+bool llama_context::init_rocketkv(const llama_rocketkv_params & params) {
+    try {
+        auto * cache = dynamic_cast<llama_kv_cache *>(memory.get());
+        if (!cache || rocketkv) {
+            throw std::invalid_argument("RocketKV requires a standard KV cache and can only be initialized once");
+        }
+        synchronize();
+        rocketkv = std::make_unique<llama_rocketkv>(model, cparams, *cache, params);
+        cparams.rocketkv = rocketkv.get();
+        gf_res_prev_active = nullptr;
+        sched_need_reserve = true;
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("RocketKV: %s\n", e.what());
+        return false;
+    }
+}
+
+llama_rocketkv_info llama_context::get_rocketkv_info() const {
+    return rocketkv ? rocketkv->info : llama_rocketkv_info{};
 }
 
 llama_context::~llama_context() {
@@ -1465,6 +1489,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (rocketkv) {
+        rocketkv->accepted += ubatch.n_tokens;
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1767,6 +1795,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+
+    if (rocketkv && !rocketkv->validate(balloc->get_batch())) {
         return -1;
     }
 
@@ -2426,6 +2458,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    if (rocketkv && rocketkv->info.active) {
+        res += 96u*model.hparams.n_layer();
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
@@ -2551,6 +2587,13 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+
+    if (rocketkv && rocketkv->info.active) {
+        // Reserve the final-prefill and sparse-decode topologies, not an intermediate prefill.
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            ubatch.pos[i] = n_tokens == 1 ? rocketkv->params.prompt_tokens : rocketkv->params.prompt_tokens - int(n_tokens) + int(i);
+        }
+    }
 
     auto * res = gf_res_reserve.get();
 
@@ -3396,6 +3439,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    if (rocketkv) {
+        throw std::runtime_error("RocketKV does not support session serialization");
+    }
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -3416,6 +3462,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    if (rocketkv) {
+        throw std::runtime_error("RocketKV does not support session restore");
+    }
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -3442,6 +3491,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (rocketkv) {
+        throw std::runtime_error("RocketKV does not support sequence serialization");
+    }
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -3450,6 +3502,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (rocketkv) {
+        throw std::runtime_error("RocketKV does not support sequence restore");
+    }
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -3489,6 +3544,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
+    if (rocketkv) {
+        for (const auto & [buft, size] : rocketkv->memory_breakdown()) {
             ret[buft].context += size;
         }
     }

@@ -4,6 +4,8 @@
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
+#import "ggml-rocketkv.h"
+#import "ggml-metal.h"
 #import "ggml-metal-common.h"
 
 #include <Foundation/Foundation.h>
@@ -142,6 +144,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(CONV,            conv)           \
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
+    X(ROCKETKV,        rocketkv)       \
     X(POOL,            pool)           \
     X(MISC,            misc)
 
@@ -829,12 +832,16 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd_buf;
+    bool concurrent;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    res->cmd_buf = [cmd_buf retain];
+    res->concurrent = concurrent;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -849,6 +856,7 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     [encoder->obj release];
+    [encoder->cmd_buf release];
     free(encoder);
 }
 
@@ -897,6 +905,21 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+#define ROCKET_PROFILE_SAMPLES 4096
+#define ROCKET_PROFILE_BUFFERS 32
+#define ROCKET_PROFILE_EVENTS (ROCKET_PROFILE_BUFFERS*ROCKET_PROFILE_SAMPLES/2)
+
+struct rocket_profile {
+    bool enabled;
+    bool failed;
+    NSLock * lock;
+    id<MTLCounterSet> counter;
+    NSMutableArray * buffers;
+    uint8_t * components;
+    uint32_t n_events;
+    MTLTimestamp cpu_start, gpu_start;
+};
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -916,7 +939,182 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+    struct rocket_profile * rocket_profile;
 };
+
+static const char * rocket_profile_names[GGML_METAL_ROCKETKV_COMPONENTS] = {
+    "s1_observe", "s1_score", "s1_pool", "s1_select", "s1_index", "s1_compact", "s1_metadata",
+    "s2_index", "s2_metadata", "s2_query", "s2_score", "s2_select", "s2_gather", "s2_attention",
+};
+
+static void rocket_profile_free(struct rocket_profile * p) {
+    if (!p) {
+        return;
+    }
+    [p->lock release];
+    [p->counter release];
+    [p->buffers release];
+    free(p->components);
+    free(p);
+}
+
+static bool rocket_profile_add_buffer(ggml_metal_device_t dev) {
+    struct rocket_profile * p = dev->rocket_profile;
+    MTLCounterSampleBufferDescriptor * desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+    desc.counterSet = p->counter;
+    desc.storageMode = MTLStorageModeShared;
+    desc.sampleCount = ROCKET_PROFILE_SAMPLES;
+    NSError * error = nil;
+    id<MTLCounterSampleBuffer> buffer = [dev->mtl_device newCounterSampleBufferWithDescriptor:desc error:&error];
+    [desc release];
+    if (!buffer) {
+        GGML_LOG_ERROR("RocketKV Metal profiling: counter allocation failed: %s\n", [[error localizedDescription] UTF8String]);
+        return false;
+    }
+    [p->buffers addObject:buffer];
+    [buffer release];
+    return true;
+}
+
+bool ggml_metal_device_rocketkv_profile_begin(ggml_metal_device_t dev) {
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+        if (![dev->mtl_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            GGML_LOG_ERROR("RocketKV Metal profiling: stage timestamps are unavailable\n");
+            return false;
+        }
+        if (dev->rocket_profile && dev->rocket_profile->enabled) {
+            GGML_LOG_ERROR("RocketKV Metal profiling: another request is active on this device\n");
+            return false;
+        }
+        rocket_profile_free(dev->rocket_profile);
+        struct rocket_profile * p = calloc(1, sizeof(*p));
+        dev->rocket_profile = p;
+        p->lock = [[NSLock alloc] init];
+        p->buffers = [[NSMutableArray alloc] init];
+        p->components = malloc(ROCKET_PROFILE_EVENTS);
+        if (!p->components) {
+            GGML_LOG_ERROR("RocketKV Metal profiling: event allocation failed\n");
+            return false;
+        }
+        for (id<MTLCounterSet> counter in dev->mtl_device.counterSets) {
+            if ([counter.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                p->counter = [counter retain];
+                break;
+            }
+        }
+        if (!p->counter || !rocket_profile_add_buffer(dev)) {
+            GGML_LOG_ERROR("RocketKV Metal profiling: timestamp counter setup failed\n");
+            return false;
+        }
+        [dev->mtl_device sampleTimestamps:&p->cpu_start gpuTimestamp:&p->gpu_start];
+        p->enabled = true;
+        return true;
+    }
+    GGML_LOG_ERROR("RocketKV Metal profiling requires macOS 11 / iOS 14 or newer\n");
+    return false;
+}
+
+bool ggml_metal_device_rocketkv_profile_enabled(ggml_metal_device_t dev) {
+    return dev->rocket_profile && dev->rocket_profile->enabled;
+}
+
+bool ggml_metal_encoder_rocketkv_profile_begin(ggml_metal_encoder_t enc, ggml_metal_device_t dev, const char * name) {
+    if (!ggml_metal_device_rocketkv_profile_enabled(dev) || strncmp(name, "rocketkv_", 9) != 0) {
+        return false;
+    }
+    int component = -1;
+    for (int i = 0; i < GGML_METAL_ROCKETKV_COMPONENTS; ++i) {
+        const size_t n = strlen(rocket_profile_names[i]);
+        if (strncmp(name + 9, rocket_profile_names[i], n) == 0 && name[9 + n] == '_') {
+            component = i;
+            break;
+        }
+    }
+    if (component < 0) {
+        return false;
+    }
+    struct rocket_profile * p = dev->rocket_profile;
+    [p->lock lock];
+    if (p->failed || p->n_events == ROCKET_PROFILE_EVENTS) {
+        p->failed = true;
+        [p->lock unlock];
+        return false;
+    }
+    const uint32_t event = p->n_events;
+    const uint32_t buffer_index = event/(ROCKET_PROFILE_SAMPLES/2);
+    if (buffer_index == [p->buffers count] && !rocket_profile_add_buffer(dev)) {
+        p->failed = true;
+        [p->lock unlock];
+        return false;
+    }
+    id<MTLCounterSampleBuffer> buffer = p->buffers[buffer_index];
+    p->components[p->n_events++] = component;
+    [p->lock unlock];
+
+    [enc->obj endEncoding];
+    [enc->obj release];
+    MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+    desc.dispatchType = MTLDispatchTypeSerial;
+    desc.sampleBufferAttachments[0].sampleBuffer = buffer;
+    desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = (event*2) % ROCKET_PROFILE_SAMPLES;
+    desc.sampleBufferAttachments[0].endOfEncoderSampleIndex = (event*2 + 1) % ROCKET_PROFILE_SAMPLES;
+    enc->obj = [[enc->cmd_buf computeCommandEncoderWithDescriptor:desc] retain];
+    return true;
+}
+
+void ggml_metal_encoder_rocketkv_profile_end(ggml_metal_encoder_t enc) {
+    [enc->obj endEncoding];
+    [enc->obj release];
+    enc->obj = [[enc->cmd_buf computeCommandEncoderWithDispatchType:
+                 enc->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial] retain];
+}
+
+bool ggml_metal_device_rocketkv_profile_end(ggml_metal_device_t dev, struct ggml_metal_rocketkv_profile * result) {
+    struct rocket_profile * p = dev->rocket_profile;
+    if (!p || !p->enabled || !result) {
+        GGML_LOG_ERROR("RocketKV Metal profiling: no active profile or invalid result buffer\n");
+        return false;
+    }
+    p->enabled = false;
+    if (p->failed) {
+        GGML_LOG_ERROR("RocketKV Metal profiling: sample capacity exceeded or counter allocation failed\n");
+        return false;
+    }
+    MTLTimestamp cpu_end, gpu_end;
+    [dev->mtl_device sampleTimestamps:&cpu_end gpuTimestamp:&gpu_end];
+    if (gpu_end <= p->gpu_start || cpu_end <= p->cpu_start) {
+        GGML_LOG_ERROR("RocketKV Metal profiling: invalid clock calibration\n");
+        return false;
+    }
+    const double scale_ms = ((double) (cpu_end - p->cpu_start)/(gpu_end - p->gpu_start))*1e-6;
+    memset(result, 0, sizeof(*result));
+    for (int i = 0; i < GGML_METAL_ROCKETKV_COMPONENTS; ++i) {
+        snprintf(result->entries[i].name, sizeof(result->entries[i].name), "%s", rocket_profile_names[i]);
+    }
+    for (uint32_t b = 0; b < [p->buffers count]; ++b) {
+        const uint32_t first = b*(ROCKET_PROFILE_SAMPLES/2);
+        const uint32_t count = MIN(ROCKET_PROFILE_SAMPLES/2, p->n_events - first);
+        id<MTLCounterSampleBuffer> buffer = p->buffers[b];
+        NSData * data = [buffer resolveCounterRange:NSMakeRange(0, 2*count)];
+        if (!data || [data length] < 2*count*sizeof(MTLCounterResultTimestamp)) {
+            GGML_LOG_ERROR("RocketKV Metal profiling: timestamp resolution failed\n");
+            return false;
+        }
+        const MTLCounterResultTimestamp * timestamps = [data bytes];
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t start = timestamps[2*i].timestamp, end = timestamps[2*i + 1].timestamp;
+            if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || end < start) {
+                GGML_LOG_ERROR("RocketKV Metal profiling: invalid timestamp at event %u\n", first + i);
+                return false;
+            }
+            struct ggml_metal_rocketkv_profile_entry * entry = &result->entries[p->components[first + i]];
+            entry->gpu_ms += (end - start)*scale_ms;
+            entry->calls++;
+        }
+    }
+    result->samples = 2*p->n_events;
+    return true;
+}
 
 //
 // MTLResidenceSet wrapper
@@ -1372,6 +1570,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 }
 
 void ggml_metal_device_free(ggml_metal_device_t dev) {
+    rocket_profile_free(dev->rocket_profile);
     assert(dev != NULL);
 
     @autoreleasepool {
@@ -1554,6 +1753,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     }
 
     switch (op->op) {
+        case GGML_OP_ROCKETKV:
+            return ggml_rocketkv_supported(op);
         case GGML_OP_SCALE:
         case GGML_OP_FILL:
         case GGML_OP_CLAMP:

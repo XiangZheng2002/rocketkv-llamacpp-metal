@@ -117,6 +117,11 @@ function(llama_build_and_test source)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
+llama_build_and_test(test-rocketkv.cpp ARGS ${CMAKE_CURRENT_SOURCE_DIR}/rocketkv/fixture.json)
+if (TARGET ggml-metal)
+    llama_test(test-rocketkv NAME test-rocketkv-metal ARGS ${CMAKE_CURRENT_SOURCE_DIR}/rocketkv/fixture.json MTL0)
+endif()
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)

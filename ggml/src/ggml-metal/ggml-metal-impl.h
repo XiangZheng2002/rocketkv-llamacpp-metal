@@ -1,6 +1,15 @@
 #ifndef GGML_METAL_IMPL
 #define GGML_METAL_IMPL
 
+struct ggml_metal_kargs_rocketkv {
+    int32_t p1, p2, f16;
+    int32_t n0, n1, n2;
+    int32_t a0, a1, a2;
+    int32_t b0, b1, b2;
+    int32_t c0;
+    uint64_t ab0, ab1, ab2;
+};
+
 // kernel parameters for mat-mat threadgroups
 //
 // TODO: become function constants

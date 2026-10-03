@@ -1,0 +1,23 @@
+RocketKV local research prototype
+
+Algorithm reference: NVlabs/RocketKV, revision
+63637c8eb4b06b5eb83cd687723b0eeb19f48f65, and the RocketKV paper
+(Behnam et al., arXiv:2502.14051).
+
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The reference implementation is distributed under the NVIDIA non-commercial
+research/evaluation license reproduced in LICENSE.NVIDIA.
+
+The reference gpt-fast/rocket.py also retains:
+Copyright (c) Graphcore 2024. All rights reserved.
+Its header refers to BSD-3; the reference pipeline/rocket.py retains the MIT
+notice for Copyright (c) 2023 Graphcore Ltd. and 2024 jiayi yuan.
+No third-party reference source is vendored here. The fixture generator loads
+the separately obtained official source read-only and records its revision.
+
+The new RocketKV-specific source, kernels, reference tests and fixture
+generator are research/evaluation-only under LICENSE.NVIDIA. Existing
+llama.cpp and GGML code retains its original licenses. This prototype is not
+represented as an upstream-ready MIT contribution. Human license review and
+the upstream contribution process are required before any redistribution or
+upstream submission.

@@ -655,6 +655,20 @@ bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     return ggml_metal_supports_family(ctx, family);
 }
 
+bool ggml_backend_metal_rocketkv_profile_begin(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_backend_synchronize(backend);
+    auto * dev = (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
+    return ggml_metal_device_rocketkv_profile_begin(dev);
+}
+
+bool ggml_backend_metal_rocketkv_profile_end(ggml_backend_t backend, ggml_metal_rocketkv_profile * result) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_backend_synchronize(backend);
+    auto * dev = (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
+    return ggml_metal_device_rocketkv_profile_end(dev, result);
+}
+
 void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

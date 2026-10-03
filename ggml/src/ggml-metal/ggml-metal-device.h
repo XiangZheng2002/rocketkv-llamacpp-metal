@@ -91,6 +91,13 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+struct ggml_metal_rocketkv_profile;
+bool ggml_metal_device_rocketkv_profile_begin(ggml_metal_device_t dev);
+bool ggml_metal_device_rocketkv_profile_end(ggml_metal_device_t dev, struct ggml_metal_rocketkv_profile * result);
+bool ggml_metal_device_rocketkv_profile_enabled(ggml_metal_device_t dev);
+bool ggml_metal_encoder_rocketkv_profile_begin(ggml_metal_encoder_t encoder, ggml_metal_device_t dev, const char * name);
+void ggml_metal_encoder_rocketkv_profile_end(ggml_metal_encoder_t encoder);
+
 //
 // MTLLibrary wrapper
 //
