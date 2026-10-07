@@ -245,6 +245,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res = 2*sizeof(int32_t)*ggml_nelements(tensor->src[0]);
             } break;
+        case GGML_OP_ROCKETKV:
+            {
+                res += ggml_metal_op_rocketkv_extra(tensor);
+            } break;
         default:
             break;
     }
@@ -659,7 +663,14 @@ bool ggml_backend_metal_rocketkv_profile_begin(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
     ggml_backend_synchronize(backend);
     auto * dev = (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
-    return ggml_metal_device_rocketkv_profile_begin(dev);
+    return ggml_metal_device_rocketkv_profile_begin(dev, false);
+}
+
+bool ggml_backend_metal_rocketkv_profile_begin_dense(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_backend_synchronize(backend);
+    auto * dev = (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
+    return ggml_metal_device_rocketkv_profile_begin(dev, true);
 }
 
 bool ggml_backend_metal_rocketkv_profile_end(ggml_backend_t backend, ggml_metal_rocketkv_profile * result) {

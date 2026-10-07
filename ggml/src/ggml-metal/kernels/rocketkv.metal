@@ -37,16 +37,20 @@ kernel void kernel_rocketkv_top_k(
         device const char * src [[buffer(1)]],
         device int * dst [[buffer(6)]],
         threadgroup int * ids [[threadgroup(0)]],
-        uint h [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint nt [[threads_per_threadgroup]]) {
+        uint2 group [[threadgroup_position_in_grid]],
+        uint2 thread_index [[thread_position_in_threadgroup]],
+        uint2 thread_count [[threads_per_threadgroup]]) {
+    const uint tid = thread_index.x, nt = thread_count.x;
+    const int h = a.p1 ? group.y : group.x;
+    const int first = a.p1 ? group.x*a.p1 : 0;
+    const int count = a.p1 ? a.p1 : a.a0;
     int padded = 1;
-    while (padded < a.a0) {
+    while (padded < count) {
         padded *= 2;
     }
     src += h*a.ab1;
     for (uint i = tid; i < uint(padded); i += nt) {
-        ids[i] = i;
+        ids[i] = first + i;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int width = 2; width <= padded; width *= 2) {
@@ -67,8 +71,69 @@ kernel void kernel_rocketkv_top_k(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+    const int output_count = a.p1 ? min(count, a.a0 - first) : a.n0;
+    for (uint i = tid; i < uint(output_count); i += nt) {
+        dst[h*a.n0 + first + i] = ids[i];
+    }
+}
+
+kernel void kernel_rocketkv_top_k_merge(
+        constant ggml_metal_kargs_rocketkv & a [[buffer(0)]],
+        device const char * src [[buffer(1)]],
+        device const int * ids [[buffer(2)]],
+        device int * dst [[buffer(6)]],
+        uint2 i [[thread_position_in_grid]]) {
+    if (i.x >= uint(a.a0)) {
+        return;
+    }
+    src += i.y*a.ab1;
+    ids += i.y*a.a0;
+    const int run = i.x/a.p1;
+    const int other = (run ^ 1)*a.p1;
+    const int count = min(a.p1, max(0, a.a0 - other));
+    const int x = ids[i.x];
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        const int mid = (lo + hi)/2;
+        if (rocket_before(src, ids[other + mid], x, a.a0, a.ab0)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const int rank = (run/2)*(2*a.p1) + i.x % a.p1 + lo;
+    if (rank < a.n0) {
+        dst[i.y*a.n0 + rank] = x;
+    }
+}
+
+kernel void kernel_rocketkv_expand_pages(
+        constant ggml_metal_kargs_rocketkv & a [[buffer(0)]],
+        device const int * pages [[buffer(1)]],
+        device const int * live [[buffer(2)]],
+        device int * dst [[buffer(6)]],
+        uint h [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nt [[threads_per_threadgroup]]) {
+    const int remainder = live[0] % a.p1;
+    const int missing = remainder ? a.p1 - remainder : 0;
+    pages += h*a.a0;
+    threadgroup int cutoff;
+    if (tid == 0) {
+        cutoff = a.n0;
+        if (remainder) {
+            for (int i = 0; i < a.a0; ++i) {
+                if (pages[i] == live[0]/a.p1) {
+                    cutoff = i*a.p1 + remainder;
+                    break;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < uint(a.n0); i += nt) {
-        dst[h*a.n0 + i] = ids[i];
+        const int expanded = i + (i >= uint(cutoff) ? missing : 0);
+        dst[h*a.n0 + i] = pages[expanded/a.p1]*a.p1 + expanded % a.p1;
     }
 }
 
@@ -159,6 +224,7 @@ kernel void kernel_rocketkv_scores(
     if (i >= uint(pages*a.a1)) {
         return;
     }
+
     const int p = i % pages, h = i/pages, kh = h/(a.a1/a.b2), n = live[0];
     float dot = 0, selected = 0, total = 0;
     if (p*page < n) {
@@ -178,5 +244,47 @@ kernel void kernel_rocketkv_scores(
     const float scale = selected > 0 ? sqrt(dim*selected/total) : 1.0f;
     for (int t = p*page; t < min(a.n0, (p + 1)*page); ++t) {
         dst[h*a.n0 + t] = t < n ? dot/scale : -INFINITY;
+    }
+}
+
+kernel void kernel_rocketkv_gather(
+        constant ggml_metal_kargs_rocketkv & a [[buffer(0)]],
+        device const char * keys [[buffer(1)]],
+        device const char * values [[buffer(2)]],
+        device const int * indices [[buffer(3)]],
+        device char * dst [[buffer(6)]],
+        uint i [[thread_position_in_grid]]) {
+    const int elements = a.n0*a.n1*a.n2;
+    if (i >= uint(2*elements)) {
+        return;
+    }
+    const int row = (i % elements)/a.n0, d = i % a.n0;
+    const int h = row/a.n1, token = indices[row];
+    device const char * src = (i < uint(elements) ? keys : values) + d*a.ab0 + token*a.ab1 + h*a.ab2;
+    if (a.f16) {
+        ((device half *) dst)[i] = *(device const half *) src;
+    } else {
+        ((device float *) dst)[i] = *(device const float *) src;
+    }
+}
+
+kernel void kernel_rocketkv_gather4(
+        constant ggml_metal_kargs_rocketkv & a [[buffer(0)]],
+        device const char * keys [[buffer(1)]],
+        device const char * values [[buffer(2)]],
+        device const int * indices [[buffer(3)]],
+        device char * dst [[buffer(6)]],
+        uint i [[thread_position_in_grid]]) {
+    const int width = a.n0/4, vectors = width*a.n1*a.n2;
+    if (i >= uint(2*vectors)) {
+        return;
+    }
+    const int row = (i % vectors)/width, d = (i % width)*4;
+    const int h = row/a.n1, token = indices[row];
+    device const char * src = (i < uint(vectors) ? keys : values) + d*a.ab0 + token*a.ab1 + h*a.ab2;
+    if (a.f16) {
+        ((device half4 *) dst)[i] = *(device const half4 *) src;
+    } else {
+        ((device float4 *) dst)[i] = *(device const float4 *) src;
     }
 }

@@ -912,6 +912,7 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
 struct rocket_profile {
     bool enabled;
     bool failed;
+    bool dense;
     NSLock * lock;
     id<MTLCounterSet> counter;
     NSMutableArray * buffers;
@@ -976,7 +977,7 @@ static bool rocket_profile_add_buffer(ggml_metal_device_t dev) {
     return true;
 }
 
-bool ggml_metal_device_rocketkv_profile_begin(ggml_metal_device_t dev) {
+bool ggml_metal_device_rocketkv_profile_begin(ggml_metal_device_t dev, bool dense) {
     if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
         if (![dev->mtl_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
             GGML_LOG_ERROR("RocketKV Metal profiling: stage timestamps are unavailable\n");
@@ -989,6 +990,7 @@ bool ggml_metal_device_rocketkv_profile_begin(ggml_metal_device_t dev) {
         rocket_profile_free(dev->rocket_profile);
         struct rocket_profile * p = calloc(1, sizeof(*p));
         dev->rocket_profile = p;
+        p->dense = dense;
         p->lock = [[NSLock alloc] init];
         p->buffers = [[NSMutableArray alloc] init];
         p->components = malloc(ROCKET_PROFILE_EVENTS);
@@ -1018,22 +1020,28 @@ bool ggml_metal_device_rocketkv_profile_enabled(ggml_metal_device_t dev) {
     return dev->rocket_profile && dev->rocket_profile->enabled;
 }
 
-bool ggml_metal_encoder_rocketkv_profile_begin(ggml_metal_encoder_t enc, ggml_metal_device_t dev, const char * name) {
-    if (!ggml_metal_device_rocketkv_profile_enabled(dev) || strncmp(name, "rocketkv_", 9) != 0) {
+bool ggml_metal_encoder_rocketkv_profile_begin(ggml_metal_encoder_t enc, ggml_metal_device_t dev, const struct ggml_tensor * node) {
+    if (!ggml_metal_device_rocketkv_profile_enabled(dev)) {
         return false;
     }
+    struct rocket_profile * p = dev->rocket_profile;
     int component = -1;
-    for (int i = 0; i < GGML_METAL_ROCKETKV_COMPONENTS; ++i) {
-        const size_t n = strlen(rocket_profile_names[i]);
-        if (strncmp(name + 9, rocket_profile_names[i], n) == 0 && name[9 + n] == '_') {
-            component = i;
-            break;
+    if (p->dense) {
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            component = 13;
+        }
+    } else if (strncmp(node->name, "rocketkv_", 9) == 0) {
+        for (int i = 0; i < GGML_METAL_ROCKETKV_COMPONENTS; ++i) {
+            const size_t n = strlen(rocket_profile_names[i]);
+            if (strncmp(node->name + 9, rocket_profile_names[i], n) == 0 && node->name[9 + n] == '_') {
+                component = i;
+                break;
+            }
         }
     }
     if (component < 0) {
         return false;
     }
-    struct rocket_profile * p = dev->rocket_profile;
     [p->lock lock];
     if (p->failed || p->n_events == ROCKET_PROFILE_EVENTS) {
         p->failed = true;

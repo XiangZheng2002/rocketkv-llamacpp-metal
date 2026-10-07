@@ -38,10 +38,16 @@ struct options {
     double depth = 0.5;
     bool lifecycle = false;
     bool profile = false;
+    bool raw_prompt = false;
 };
 
 static double ms(clock_type::time_point start) {
     return std::chrono::duration<double, std::milli>(clock_type::now() - start).count();
+}
+
+static bool graph_debug_enabled() {
+    const char * value = std::getenv("GGML_METAL_GRAPH_DEBUG");
+    return value && std::atoi(value) > 0;
 }
 
 static options parse(int argc, char ** argv) {
@@ -53,7 +59,8 @@ static options parse(int argc, char ** argv) {
                       "  --prompt-tokens 2048 --generate 32 --budget 256 --window 32 --pool 63\n"
                       "  --repetitions 3 --warmup 1 --ubatch 512 --gpu-layers 99\n"
                       "  --prompt TEXT | --prompt-file FILE | --passkey 74219 --depth 0.5\n"
-                      "  --output result.json --validate-lifecycle --profile\n"
+                      "  --output result.json --validate-lifecycle --profile --raw-prompt\n"
+                      "Use --raw-prompt with prepared benchmark prompts to skip chat templating.\n"
                       "Generation is greedy and fixed-length, including tokens after the first EOG.\n"
                       "RocketKV is an experimental single-turn Llama/F16-KV path, not a server mode.");
             std::exit(0);
@@ -64,6 +71,10 @@ static options parse(int argc, char ** argv) {
         }
         if (key == "--profile") {
             opt.profile = true;
+            continue;
+        }
+        if (key == "--raw-prompt") {
+            opt.raw_prompt = true;
             continue;
         }
         if (++i == argc) {
@@ -105,10 +116,11 @@ static options parse(int argc, char ** argv) {
         }
     }
     if (opt.model.empty() || (opt.mode != "full" && opt.mode != "rocket") || (opt.kv != "f16" && opt.kv != "q8_0") ||
-        opt.prompt_tokens < 64 || opt.prompt_tokens > 8192 || opt.generate < 2 || opt.generate > 512 ||
+        opt.prompt_tokens < 64 || opt.prompt_tokens > 32768 || opt.generate < 2 || opt.generate > 512 ||
         opt.repetitions < 1 || opt.repetitions > 100 || opt.warmup < 0 || opt.warmup > 10 ||
         opt.ubatch < 1 || opt.ubatch > 2048 || opt.gpu_layers < 0 || opt.gpu_layers > 999 ||
         (!opt.prompt.empty() && !opt.prompt_file.empty()) || (opt.mode == "rocket" && opt.kv != "f16") ||
+        (opt.raw_prompt && opt.prompt.empty() && opt.prompt_file.empty()) ||
         (opt.profile && opt.gpu_layers == 0)) {
         throw std::invalid_argument("invalid configuration; use --help");
     }
@@ -160,7 +172,7 @@ static std::vector<llama_token> make_prompt(const options & opt, const llama_voc
             file.seekg(0);
             text.assign(std::istreambuf_iterator<char>(file), {});
         }
-        return tokenize(vocab, header + text + footer);
+        return tokenize(vocab, opt.raw_prompt ? text : header + text + footer);
     }
     auto prefix = tokenize(vocab, header + "Read this archive carefully.\n");
     auto suffix = tokenize(vocab, opt.passkey.empty() ?
@@ -259,7 +271,7 @@ static json run(const options & opt, llama_model * model, const std::vector<llam
                 break;
             }
         }
-        if (!profile_backend || !ggml_backend_metal_rocketkv_profile_begin(profile_backend)) {
+        if (!profile_backend || (opt.mode != "full" && !ggml_backend_metal_rocketkv_profile_begin(profile_backend))) {
             throw std::runtime_error("Metal timestamp profiling is unavailable");
         }
 #else
@@ -296,6 +308,11 @@ static json run(const options & opt, llama_model * model, const std::vector<llam
     std::string output = piece(vocab, next);
     std::string answer = llama_vocab_is_eog(vocab, next) ? "" : output;
     int first_eog = llama_vocab_is_eog(vocab, next) ? 0 : -1;
+#ifdef ROCKETKV_METAL
+    if (opt.profile && opt.mode == "full" && !ggml_backend_metal_rocketkv_profile_begin_dense(profile_backend)) {
+        throw std::runtime_error("Metal decode attention profiling is unavailable");
+    }
+#endif
     const auto decode_start = clock_type::now();
     for (int i = 1; i < opt.generate; ++i) {
         batch.n_tokens = 1;
@@ -344,10 +361,24 @@ static json run(const options & opt, llama_model * model, const std::vector<llam
             } else {
                 selection_ms += entry.gpu_ms;
             }
-            if (ri.active && (profile.entries[8].calls != uint64_t(llama_model_n_layer(model))*(opt.generate - 1) ||
-                              profile.entries[13].calls != profile.entries[8].calls)) {
-                throw std::runtime_error("not all RocketKV layers were profiled on Metal");
+        }
+        const uint64_t expected = uint64_t(llama_model_n_layer(model))*(opt.generate - 1);
+        if (ri.active && (profile.entries[8].calls != expected || profile.entries[13].calls != expected)) {
+            throw std::runtime_error("not all RocketKV layers were profiled on Metal");
+        }
+        if (ri.active) {
+            const uint64_t layers = llama_model_n_layer(model);
+            if (profile.entries[3].calls != layers || profile.entries[6].calls != layers) {
+                throw std::runtime_error("RocketKV Stage 1 selection or compaction metadata is missing");
             }
+            for (int i = 9; i <= 12; ++i) {
+                if (profile.entries[i].calls < expected) {
+                    throw std::runtime_error("RocketKV Stage 2 query, scoring, selection or gather is missing");
+                }
+            }
+        }
+        if (opt.mode == "full" && profile.entries[13].calls != expected) {
+            throw std::runtime_error("not all Full KV decode attention layers were profiled on Metal");
         }
 #endif
     }
@@ -375,6 +406,7 @@ static json run(const options & opt, llama_model * model, const std::vector<llam
     result["repetition"] = repetition;
     result["warmup"] = repetition < 0;
     result["mode"] = opt.mode;
+    result["rocket_variant"] = opt.mode == "full" ? "full_kv" : "rocketkv_hybrid";
     result["kv_type"] = opt.kv;
     result["prompt_tokens"] = prompt.size();
     result["n_ctx_allocated"] = llama_n_ctx(ctx.get());
@@ -389,12 +421,14 @@ static json run(const options & opt, llama_model * model, const std::vector<llam
     result["query_dims"] = ri.query_dims;
     result["attention_tokens"] = ri.attention_tokens;
     result["engine_ttft_ms"] = ttft;
-    result["instrumented"] = opt.profile;
+    result["instrumented"] = opt.profile || graph_debug_enabled();
     result["component_gpu_ms"] = std::move(component_ms);
     result["component_calls"] = std::move(component_calls);
-    result["stage1_gpu_ms"] = opt.profile ? json(stage1_ms) : json(nullptr);
-    result["stage2_selection_metadata_gather_gpu_ms"] = opt.profile ? json(selection_ms) : json(nullptr);
-    result["sparse_attention_gpu_ms"] = opt.profile ? json(attention_ms) : json(nullptr);
+    result["gpu_profile_scope"] = opt.profile ? json(opt.mode == "full" ? "decode_attention" : "rocketkv_components") : json(nullptr);
+    result["stage1_gpu_ms"] = opt.profile && opt.mode == "rocket" ? json(stage1_ms) : json(nullptr);
+    result["stage2_selection_metadata_gather_gpu_ms"] = opt.profile && opt.mode == "rocket" ? json(selection_ms) : json(nullptr);
+    result["sparse_attention_gpu_ms"] = opt.profile && opt.mode == "rocket" ? json(attention_ms) : json(nullptr);
+    result["dense_attention_gpu_ms"] = opt.profile && opt.mode == "full" ? json(attention_ms) : json(nullptr);
     result["request_ttft_ms"] = request_ttft;
     result["context_setup_ms"] = setup_ms;
     result["decode_total_ms"] = decode_ms;
@@ -430,7 +464,7 @@ int main(int argc, char ** argv) {
     try {
         const auto opt = parse(argc, argv);
         const auto logger = [](ggml_log_level level, const char * text, void *) {
-            if (level != GGML_LOG_LEVEL_DEBUG) {
+            if (level != GGML_LOG_LEVEL_DEBUG || graph_debug_enabled()) {
                 std::fputs(text, stderr);
             }
         };
@@ -447,8 +481,8 @@ int main(int argc, char ** argv) {
         }
         const double load_ms = ms(load_start);
         const auto prompt = make_prompt(opt, llama_model_get_vocab(model.get()));
-        if (prompt.size() > 8192) {
-            throw std::invalid_argument("this MVP limits prompts to 8192 tokens");
+        if (prompt.size() > 32768) {
+            throw std::invalid_argument("this benchmark limits prompts to 32768 tokens");
         }
         json records = json::array();
         for (int i = -opt.warmup; i < opt.repetitions; ++i) {
@@ -467,6 +501,8 @@ int main(int argc, char ** argv) {
         document["gpu_layers"] = opt.gpu_layers;
         document["observation_window"] = opt.window;
         document["pooling_kernel"] = opt.pool;
+        document["raw_prompt"] = opt.raw_prompt;
+        document["graph_debug"] = graph_debug_enabled();
         document["records"] = std::move(records);
         const std::string serialized = document.dump(2) + "\n";
         if (opt.output.empty()) {

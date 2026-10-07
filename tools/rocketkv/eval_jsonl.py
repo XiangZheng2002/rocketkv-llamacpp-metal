@@ -13,7 +13,7 @@ def normalize(record, kind, template=None):
     elif "prompt" in record:
         prompt = record["prompt"]
     elif kind == "ruler" and "input" in record:
-        prompt = record["input"]
+        prompt = record["input"] + record.get("answer_prefix", "")
     else:
         raise ValueError("LongBench needs a prepared 'prompt' or --template with {context}/{input}; raw context is never silently dropped")
     if not isinstance(prompt, str) or not prompt:
@@ -60,7 +60,8 @@ def main():
             prompt_file.write_text(prompt)
             command = [
                 str(args.binary.resolve()), "-m", str(args.model.resolve()), "--mode", args.mode,
-                "--prompt-file", str(prompt_file), "--generate", str(args.generate),
+                "--prompt-file", str(prompt_file), "--raw-prompt",
+                "--generate", str(record.get("tokens_to_generate", args.generate)),
                 "--warmup", "0", "--repetitions", "1", "--output", str(result_file),
             ]
             if args.mode == "rocket":

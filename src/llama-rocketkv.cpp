@@ -86,7 +86,7 @@ llama_rocketkv::llama_rocketkv(const llama_model & model, const llama_cparams & 
     if (cache.get_cells(0).get_used() != 0) {
         throw std::invalid_argument("enable RocketKV on an empty context");
     }
-    if (params.prompt_tokens < 1 || params.prompt_tokens > 8192 || params.decode_tokens < 1 ||
+    if (params.prompt_tokens < 1 || params.prompt_tokens > 32768 || params.decode_tokens < 1 ||
         params.decode_tokens > 8192 || params.prompt_tokens + params.decode_tokens > (int64_t) cparams.n_ctx ||
         params.token_budget < 2 || params.token_budget > 8192 ||
         params.observation_window < 1 || params.observation_window > 256 ||
@@ -241,8 +241,10 @@ ggml_tensor * llama_rocketkv::decode(ggml_context * ctx, llm_graph_result * res,
     input->live = rocket_input_tensor(ctx, GGML_TYPE_I32, 1);
     input->write = rocket_input_tensor(ctx, GGML_TYPE_I64, 1);
     auto * gf = res->get_gf();
-    auto * kflat = rocket_name(ggml_cont_2d(ctx, k, dim*kv_heads, 1), "s2_index", il);
-    auto * vflat = rocket_name(ggml_cont_2d(ctx, v, dim*kv_heads, 1), "s2_index", il);
+    auto * kflat = rocket_name(ggml_is_contiguous(k) ?
+        ggml_reshape_2d(ctx, k, dim*kv_heads, 1) : ggml_cont_2d(ctx, k, dim*kv_heads, 1), "s2_index", il);
+    auto * vflat = rocket_name(ggml_is_contiguous(v) ?
+        ggml_reshape_2d(ctx, v, dim*kv_heads, 1) : ggml_cont_2d(ctx, v, dim*kv_heads, 1), "s2_index", il);
     auto * kw = rocket_name(ggml_set_rows(ctx, cache.get_k_storage(il), kflat, input->write), "s2_index", il);
     auto * vw = rocket_name(ggml_set_rows(ctx, cache.get_v_storage(il), vflat, input->write), "s2_index", il);
     ggml_build_forward_expand(gf, kw);
@@ -256,11 +258,11 @@ ggml_tensor * llama_rocketkv::decode(ggml_context * ctx, llm_graph_result * res,
     auto * scores = rocket_name(ggml_rocketkv_scores(ctx, q, meta, dims, sums, input->live, info.page_size, info.capacity), "s2_score", il);
     auto * weights = rocket_name(ggml_soft_max(ctx, scores), "s2_score", il);
     auto * group_weights = rocket_name(ggml_rocketkv_reduce(ctx, weights, kv_heads, info.capacity), "s2_score", il);
-    auto * top = rocket_name(ggml_rocketkv_top_k(ctx, group_weights, info.attention_tokens), "s2_select", il);
-    auto * kg = rocket_name(ggml_get_rows(ctx, ggml_permute(ctx, keys, 0, 2, 1, 3), top), "s2_gather", il);
-    auto * vg = rocket_name(ggml_get_rows(ctx, ggml_permute(ctx, values, 0, 2, 1, 3), top), "s2_gather", il);
-    kg = rocket_name(ggml_cast(ctx, kg, GGML_TYPE_F16), "s2_gather", il);
-    vg = rocket_name(ggml_cast(ctx, vg, GGML_TYPE_F16), "s2_gather", il);
+    auto * top = rocket_name(ggml_rocketkv_page_top_k(ctx, group_weights, input->live, info.page_size, info.attention_tokens), "s2_select", il);
+    auto * gathered = rocket_name(ggml_rocketkv_gather(ctx, ggml_permute(ctx, keys, 0, 2, 1, 3),
+        ggml_permute(ctx, values, 0, 2, 1, 3), top), "s2_gather", il);
+    auto * kg = ggml_view_3d(ctx, gathered, dim, info.attention_tokens, kv_heads, gathered->nb[1], gathered->nb[2], 0);
+    auto * vg = ggml_view_3d(ctx, gathered, dim, info.attention_tokens, kv_heads, gathered->nb[1], gathered->nb[2], gathered->nb[3]);
     auto * out = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), kg, vg, nullptr, scale, 0, 0);
     ggml_prec_set_acc(out, GGML_PREC_F32);
     rocket_name(out, "s2_attention", il);

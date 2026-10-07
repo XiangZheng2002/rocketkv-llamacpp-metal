@@ -2,6 +2,10 @@
 
 List of GGML operations and backend support status.
 
+The local RocketKV CPU/Metal stable top-k supports up to 32768 entries per row, with ascending original indices on equal scores. Metal uses 256-entry blocks and GPU merges for rows above 512 entries selecting at most 256 indices; other shapes retain the single-block or 8192-entry-block paths. Its paired K/V gather preserves F16/F32 values without an intermediate type conversion.
+
+For nonnegative, page-constant token probabilities, RocketKV can select pages and expand them back to the exact token top-k, accounting for the partial live page. CPU and Metal test this path against full token sorting, including zero scores and ties.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

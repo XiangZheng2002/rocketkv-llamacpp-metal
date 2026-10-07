@@ -84,12 +84,18 @@ static void test_graph(const json & c, ggml_backend_t backend) {
     auto * weights = ggml_soft_max(ctx.get(), approx);
     auto * group_weights = ggml_rocketkv_reduce(ctx.get(), weights, hk, cap);
     auto * top = ggml_rocketkv_top_k(ctx.get(), group_weights, count);
+    auto * page_top = ggml_rocketkv_page_top_k(ctx.get(), group_weights, live, page, count);
     auto * kg = ggml_get_rows(ctx.get(), kc, top);
     auto * vg = ggml_get_rows(ctx.get(), vc, top);
+    auto * gathered = ggml_rocketkv_gather(ctx.get(), kc, vc, top);
+    auto * gathered_k = ggml_view_3d(ctx.get(), gathered, d, count, hk, gathered->nb[1], gathered->nb[2], 0);
+    auto * gathered_v = ggml_view_3d(ctx.get(), gathered, d, count, hk, gathered->nb[1], gathered->nb[2], gathered->nb[3]);
     auto * q = ggml_permute(ctx.get(), query, 0, 2, 1, 3);
     auto * exact = ggml_soft_max_ext(ctx.get(), ggml_mul_mat(ctx.get(), kg, q), nullptr, 1/std::sqrt(float(d)), 0);
     auto * output = ggml_mul_mat(ctx.get(), ggml_cont(ctx.get(), ggml_transpose(ctx.get(), vg)), exact);
     ggml_build_forward_expand(gf, output);
+    ggml_build_forward_expand(gf, gathered);
+    ggml_build_forward_expand(gf, page_top);
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         auto * node = ggml_graph_node(gf, i);
         if (!ggml_backend_supports_op(backend, node)) {
@@ -159,8 +165,11 @@ static void test_graph(const json & c, ggml_backend_t backend) {
     check("graph approximate pages", pages_actual, c.at("page_scores"), 2e-4f);
     check("graph approximate tokens", read_tensor(group_weights), c.at("token_scores"), 2e-4f);
     ids("graph top-k", top, c.at("selected"));
+    ids("graph page top-k", page_top, c.at("selected"));
     check("graph gather K", read_tensor(kg), c.at("gather_k"), 0);
     check("graph gather V", read_tensor(vg), c.at("gather_v"), 0);
+    check("graph native gather K", read_tensor(gathered_k), c.at("gather_k"), 0);
+    check("graph native gather V", read_tensor(gathered_v), c.at("gather_v"), 0);
     check("graph attention", read_tensor(output), c.at("output"), 5e-4f);
     std::vector<float> zeros(d*h);
     ggml_backend_tensor_set(query, zeros.data(), 0, ggml_nbytes(query));
@@ -173,12 +182,13 @@ static void test_graph(const json & c, ggml_backend_t backend) {
     update(zero_meta, ck, 0);
     const auto zero_ref = hsa(zero, ck, cv, zero_meta, r, count);
     ids("graph zero-query ties", top, zero_ref.indices);
+    ids("graph zero-query page ties", page_top, zero_ref.indices);
     check("graph zero-query attention", read_tensor(output), zero_ref.output.data, 5e-4f);
     std::printf("PASS %s graph %s\n", ggml_backend_name(backend), c.at("name").get<std::string>().c_str());
 }
 
-static void test_incremental(ggml_backend_t backend, ggml_type type, int page) {
-    const int dim = 16, heads = 4, kv_heads = 2, capacity = 13;
+static void test_incremental(ggml_backend_t backend, ggml_type type, int page, int capacity = 13, int group = 2) {
+    const int dim = 16, kv_heads = 2, heads = kv_heads*group;
     ggml_context_ptr ctx(ggml_init({2*1024*1024, nullptr, true}));
     auto * k = ggml_new_tensor_3d(ctx.get(), type, dim, kv_heads, capacity);
     auto * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, heads, 1);
@@ -263,7 +273,7 @@ static void test_incremental(ggml_backend_t backend, ggml_type type, int page) {
             }
         }
     }
-    std::printf("PASS %s incremental %s page=%d, partial pages and padding\n", ggml_backend_name(backend), ggml_type_name(type), page);
+    std::printf("PASS %s incremental %s page=%d capacity=%d group=%d, partial pages and padding\n", ggml_backend_name(backend), ggml_type_name(type), page, capacity, group);
 }
 
 static void test_case(const json & c) {
@@ -317,6 +327,157 @@ static void test_case(const json & c) {
     std::printf("PASS %s\n", c.at("name").get<std::string>().c_str());
 }
 
+static void test_page_selection(ggml_backend_t backend, int capacity, int page, int count) {
+    const int heads = 3;
+    ggml_context_ptr ctx(ggml_init({1024*1024, nullptr, true}));
+    auto * scores = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, capacity, heads);
+    auto * live = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    auto * original = ggml_rocketkv_top_k(ctx.get(), scores, count);
+    auto * selected = ggml_rocketkv_page_top_k(ctx.get(), scores, live, page, count);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, original);
+    ggml_build_forward_expand(graph, selected);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        throw std::runtime_error("page-selection allocation failed");
+    }
+    std::vector<float> values(capacity*heads);
+    std::vector<int32_t> baseline(count*heads), actual(count*heads);
+    for (int n : {count, std::min(capacity, count + 1), std::max(count, capacity - 4),
+                  std::max(count, capacity - 3), std::max(count, capacity - 2),
+                  std::max(count, capacity - 1), capacity}) {
+        for (bool zeros : {false, true}) {
+            std::fill(values.begin(), values.end(), 0);
+            for (int h = 0; h < heads; ++h) {
+                for (int t = 0; t < n; ++t) {
+                    const int p = t/page;
+                    float value = float((p*7 + h*3) % 13)/16;
+                    if (p == (n - 1)/page && h != 2) {
+                        value = h == 0 ? 2.0f : 0.0f;
+                    }
+                    values[h*capacity + t] = zeros ? 0 : value;
+                }
+            }
+            ggml_backend_tensor_set(scores, values.data(), 0, ggml_nbytes(scores));
+            ggml_backend_tensor_set(live, &n, 0, sizeof(n));
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("page-selection graph failed");
+            }
+            ggml_backend_tensor_get(original, baseline.data(), 0, ggml_nbytes(original));
+            ggml_backend_tensor_get(selected, actual.data(), 0, ggml_nbytes(selected));
+            if (actual != baseline) {
+                throw std::runtime_error("page-selection mismatch: capacity=" + std::to_string(capacity) +
+                    ", page=" + std::to_string(page) + ", count=" + std::to_string(count) + ", live=" + std::to_string(n));
+            }
+            for (int32_t index : actual) {
+                if (index < 0 || index >= n) {
+                    throw std::runtime_error("page selection included an unused cache position");
+                }
+            }
+        }
+    }
+    std::printf("PASS %s page selection capacity=%d page=%d k=%d\n", ggml_backend_name(backend), capacity, page, count);
+}
+
+static void test_gather_layout(ggml_backend_t backend, ggml_type type, int dim, int offset) {
+    const int heads = 3, capacity = 19, count = 7, stride = dim + offset;
+    ggml_context_ptr ctx(ggml_init({1024*1024, nullptr, true}));
+    auto * keys = ggml_new_tensor_3d(ctx.get(), type, stride, heads, capacity);
+    auto * values = ggml_new_tensor_3d(ctx.get(), type, stride, heads, capacity);
+    auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, count, heads);
+    auto * kview = ggml_view_3d(ctx.get(), keys, dim, heads, capacity, keys->nb[1], keys->nb[2], offset*ggml_type_size(type));
+    auto * vview = ggml_view_3d(ctx.get(), values, dim, heads, capacity, values->nb[1], values->nb[2], offset*ggml_type_size(type));
+    auto * gathered = ggml_rocketkv_gather(ctx.get(), ggml_permute(ctx.get(), kview, 0, 2, 1, 3),
+        ggml_permute(ctx.get(), vview, 0, 2, 1, 3), ids);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, gathered);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        throw std::runtime_error("gather-layout allocation failed");
+    }
+    std::vector<float> k(stride*heads*capacity), v(k.size()), expected;
+    std::vector<int32_t> selected(count*heads);
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = float(int(i*17 % 127) - 63)/16;
+        v[i] = 1 - k[i];
+    }
+    auto set = [&](ggml_tensor * t, const std::vector<float> & data) {
+        if (type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> half(data.size());
+            ggml_fp32_to_fp16_row(data.data(), half.data(), data.size());
+            ggml_backend_tensor_set(t, half.data(), 0, ggml_nbytes(t));
+        } else {
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    };
+    set(keys, k);
+    set(values, v);
+    for (int h = 0; h < heads; ++h) {
+        for (int i = 0; i < count; ++i) {
+            selected[h*count + i] = (i*3 + h*5) % capacity;
+        }
+    }
+    ggml_backend_tensor_set(ids, selected.data(), 0, ggml_nbytes(ids));
+    for (const auto * source : {&k, &v}) {
+        for (int h = 0; h < heads; ++h) {
+            for (int i = 0; i < count; ++i) {
+                for (int d = 0; d < dim; ++d) {
+                    expected.push_back((*source)[(selected[h*count + i]*heads + h)*stride + offset + d]);
+                }
+            }
+        }
+    }
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("gather-layout computation failed");
+    }
+    check("gather layout", read_tensor(gathered), expected, 0);
+    std::printf("PASS %s gather %s dim=%d offset=%d\n", ggml_backend_name(backend), ggml_type_name(type), dim, offset);
+}
+
+static void test_long_top_k(ggml_backend_t backend, int n, int k) {
+    const int heads = 3;
+    ggml_context_ptr ctx(ggml_init({1024*1024, nullptr, true}));
+    auto * data = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n, 2, heads);
+    auto * scores = ggml_view_2d(ctx.get(), data, n, heads, data->nb[2], 0);
+    auto * selected = ggml_rocketkv_top_k(ctx.get(), scores, k);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, selected);
+    if (!ggml_backend_supports_op(backend, selected)) {
+        throw std::runtime_error("backend does not support long stable top-k");
+    }
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        throw std::runtime_error("long top-k allocation failed");
+    }
+    std::vector<float> values(n*2*heads, NAN);
+    std::vector<int> expected;
+    for (int h = 0; h < heads; ++h) {
+        std::vector<float> row(n);
+        for (int i = 0; i < n; ++i) {
+            row[i] = h == 0 ? 0.0f : float((i*7919 + h*31) % 127 - 63);
+        }
+        if (h == 2) {
+            row[n - 1] = row[n/2] = INFINITY;
+            row[0] = -INFINITY;
+        }
+        std::copy(row.begin(), row.end(), values.begin() + h*2*n);
+        const auto ids = topk(row, k);
+        expected.insert(expected.end(), ids.begin(), ids.end());
+    }
+    ggml_backend_tensor_set(data, values.data(), 0, ggml_nbytes(data));
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("long top-k computation failed");
+        }
+        std::vector<int> actual(k*heads);
+        ggml_backend_tensor_get(selected, actual.data(), 0, ggml_nbytes(selected));
+        if (actual != expected) {
+            throw std::runtime_error("long top-k indices differ for n=" + std::to_string(n) + ", k=" + std::to_string(k));
+        }
+    }
+    std::printf("PASS %s stable top-k n=%d k=%d\n", ggml_backend_name(backend), n, k);
+}
+
 int main(int argc, char ** argv) {
     try {
         if (argc < 2 || argc > 3) {
@@ -341,6 +502,29 @@ int main(int argc, char ** argv) {
         for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             for (int page : {1, 2, 3, 5}) {
                 test_incremental(backend.get(), type, page);
+            }
+            for (int capacity : {9, 12, 15, 17}) {
+                test_incremental(backend.get(), type, 3, capacity);
+            }
+            for (int group : {1, 3, 4, 5, 8}) {
+                test_incremental(backend.get(), type, 3, 13, group);
+            }
+            for (int dim : {7, 64, 128}) {
+                for (int offset : {0, 1}) {
+                    test_gather_layout(backend.get(), type, dim, offset);
+                }
+            }
+            for (int n : {128, 512, 513, 1025, 4095, 4096, 4097, 8192, 8193, 16383, 16384, 16385, 32736, 32768}) {
+                for (int k : {1, 17, std::min(256, n), std::min(257, n), std::min(4096, n), n}) {
+                    test_long_top_k(backend.get(), n, k);
+                }
+            }
+        }
+        for (int capacity : {1, 13, 257, 1031}) {
+            for (int page : {1, 2, 3, 5}) {
+                for (int count : {1, std::min(17, capacity), std::min(256, capacity), capacity}) {
+                    test_page_selection(backend.get(), capacity, page, count);
+                }
             }
         }
         check_ids("stable ties", topk({1, 1, 1, 0}, 2), json::array({0, 1}));

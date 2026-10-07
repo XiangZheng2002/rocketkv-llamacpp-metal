@@ -26,8 +26,27 @@ ggml_tensor * ggml_rocketkv_reduce(ggml_context * ctx, ggml_tensor * scores, int
 
 ggml_tensor * ggml_rocketkv_top_k(ggml_context * ctx, ggml_tensor * scores, int32_t k) {
     GGML_ASSERT(scores->type == GGML_TYPE_F32 && scores->ne[2] == 1 && scores->ne[3] == 1);
-    GGML_ASSERT(scores->ne[0] <= 8192 && k > 0 && k <= scores->ne[0]);
+    GGML_ASSERT(scores->ne[0] <= 32768 && k > 0 && k <= scores->ne[0]);
     return rocket_op(ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, scores->ne[1]), GGML_ROCKETKV_TOP_K, scores);
+}
+
+ggml_tensor * ggml_rocketkv_page_top_k(ggml_context * ctx, ggml_tensor * scores, ggml_tensor * live, int32_t page, int32_t k) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && scores->ne[2] == 1 && scores->ne[3] == 1);
+    GGML_ASSERT(scores->ne[0] > 0 && scores->ne[0] <= 8192 && k > 0 && k <= scores->ne[0]);
+    GGML_ASSERT(page > 0 && page <= 8192 && live->type == GGML_TYPE_I32 && ggml_nelements(live) == 1);
+    if (page == 1) {
+        return ggml_rocketkv_top_k(ctx, scores, k);
+    }
+    const int pages = (scores->ne[0] + page - 1)/page;
+    auto * weights = ggml_view_3d(ctx, scores, 1, pages, scores->ne[1], page*scores->nb[0], scores->nb[1], 0);
+    weights = ggml_permute(ctx, weights, 2, 0, 1, 3);
+    // One partial live page can contribute fewer tokens than a full page.
+    auto * selected = ggml_rocketkv_top_k(ctx, weights, std::min(pages, (k + page - 1)/page + 1));
+    ggml_set_name(selected, "rocketkv_s2_select_pages");
+    auto * out = rocket_op(ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, scores->ne[1]),
+                           GGML_ROCKETKV_EXPAND_PAGES, selected, page, scores->ne[0]);
+    out->src[1] = live;
+    return out;
 }
 
 ggml_tensor * ggml_rocketkv_indices(ggml_context * ctx, ggml_tensor * selected, int32_t window, int32_t prompt) {
@@ -78,6 +97,23 @@ ggml_tensor * ggml_rocketkv_scores(ggml_context * ctx, ggml_tensor * queries, gg
     return out;
 }
 
+ggml_tensor * ggml_rocketkv_gather(ggml_context * ctx, ggml_tensor * keys, ggml_tensor * values, ggml_tensor * indices) {
+    GGML_ASSERT(keys->type == GGML_TYPE_F16 || keys->type == GGML_TYPE_F32);
+    GGML_ASSERT(keys->type == values->type && ggml_are_same_shape(keys, values) && keys->ne[3] == 1);
+    GGML_ASSERT(keys->nb[0] == ggml_type_size(keys->type));
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(keys->nb[i] == values->nb[i]);
+    }
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[0] > 0 && indices->ne[0] <= keys->ne[1] && indices->ne[1] == keys->ne[2]);
+    GGML_ASSERT(indices->ne[2] == 1 && indices->ne[3] == 1);
+    auto * out = rocket_op(ggml_new_tensor_4d(ctx, keys->type, keys->ne[0], indices->ne[0], keys->ne[2], 2),
+                           GGML_ROCKETKV_GATHER, keys);
+    out->src[1] = values;
+    out->src[2] = indices;
+    return out;
+}
+
 bool ggml_rocketkv_supported(const ggml_tensor * op) {
     if (op->op != GGML_OP_ROCKETKV || !op->src[0] || !ggml_is_contiguous(op)) {
         return false;
@@ -87,7 +123,7 @@ bool ggml_rocketkv_supported(const ggml_tensor * op) {
         case GGML_ROCKETKV_QUERY:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_ROCKETKV_TOP_K:
-            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 8192;
+            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 32768;
         case GGML_ROCKETKV_INDICES:
             return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32;
         case GGML_ROCKETKV_METADATA:
@@ -99,6 +135,12 @@ bool ggml_rocketkv_supported(const ggml_tensor * op) {
                 op->src[2] && op->src[2]->type == GGML_TYPE_I32 &&
                 op->src[3] && op->src[3]->type == GGML_TYPE_F32 &&
                 op->src[4] && op->src[4]->type == GGML_TYPE_I32;
+        case GGML_ROCKETKV_GATHER:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->src[0]->type == op->type &&
+                op->src[1] && op->src[1]->type == op->type && op->src[2] && op->src[2]->type == GGML_TYPE_I32;
+        case GGML_ROCKETKV_EXPAND_PAGES:
+            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32 &&
+                op->src[1] && op->src[1]->type == GGML_TYPE_I32;
         default:
             return false;
     }
@@ -232,6 +274,33 @@ void ggml_rocketkv_compute_forward(ggml_tensor * out, int ith, int nth) {
                         ((float *) out->data)[h*out->ne[0] + t] = t < live ? score/scale : -INFINITY;
                     }
                 }
+            }
+        } break;
+        case GGML_ROCKETKV_GATHER: {
+            const int rows = out->ne[1]*out->ne[2];
+            const auto * ids = (const int32_t *) out->src[2]->data;
+            for (int row = ith; row < 2*rows; row += nth) {
+                const int h = (row % rows)/out->ne[1], index = ids[row % rows];
+                GGML_ASSERT(index >= 0 && index < a->ne[1]);
+                const auto * source = row < rows ? a : out->src[1];
+                std::memcpy((char *) out->data + row*out->nb[1],
+                            (const char *) source->data + index*a->nb[1] + h*a->nb[2], out->nb[1]);
+            }
+        } break;
+        case GGML_ROCKETKV_EXPAND_PAGES: {
+            const int page = out->op_params[1], live = *(const int32_t *) out->src[1]->data;
+            GGML_ASSERT(live >= out->ne[0] && live <= out->op_params[2]);
+            for (int h = ith; h < out->ne[1]; h += nth) {
+                const auto * pages = (const int32_t *) a->data + h*a->ne[0];
+                auto * ids = (int32_t *) out->data + h*out->ne[0];
+                int count = 0;
+                for (int i = 0; i < a->ne[0] && count < out->ne[0]; ++i) {
+                    GGML_ASSERT(pages[i] >= 0 && pages[i] < (out->op_params[2] + page - 1)/page);
+                    for (int t = pages[i]*page; t < std::min(live, (pages[i] + 1)*page) && count < out->ne[0]; ++t) {
+                        ids[count++] = t;
+                    }
+                }
+                GGML_ASSERT(count == out->ne[0]);
             }
         } break;
         default:

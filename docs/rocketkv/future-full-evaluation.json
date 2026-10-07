@@ -2,7 +2,7 @@
   "status": "prepared_not_executed",
   "model": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
   "model_weights": "Llama-3.1-8B-Instruct, ready-made Q4 GGUF; do not convert source weights",
-  "warning": "16K/32K require lifting the current 8192-entry stable-sort and benchmark prompt bounds. Reassess unified memory before any 8B run.",
+  "warning": "Prompts through 32768 are supported; RocketKV compressed capacity is limited to 8192. Reassess unified memory before any 8B run.",
   "runs": [
     {
       "context": 4096,
@@ -304,7 +304,7 @@
         "--repetitions",
         "3"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 16384,
@@ -328,7 +328,7 @@
         "--budget",
         "1024"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 16384,
@@ -352,7 +352,7 @@
         "--budget",
         "2048"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 16384,
@@ -374,7 +374,7 @@
         "--repetitions",
         "3"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 16384,
@@ -398,7 +398,7 @@
         "--budget",
         "1024"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 16384,
@@ -422,7 +422,7 @@
         "--budget",
         "2048"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 32768,
@@ -444,7 +444,7 @@
         "--repetitions",
         "3"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 32768,
@@ -468,7 +468,7 @@
         "--budget",
         "1024"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 32768,
@@ -514,7 +514,7 @@
         "--repetitions",
         "3"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 32768,
@@ -538,7 +538,7 @@
         "--budget",
         "1024"
       ],
-      "requires_implementation_extension": true
+      "requires_implementation_extension": false
     },
     {
       "context": 32768,

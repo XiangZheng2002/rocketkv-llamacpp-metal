@@ -6823,6 +6823,19 @@ struct test_rocketkv : public test_case {
             auto * top = ggml_rocketkv_top_k(ctx, sort_input, std::min(17, n));
             return kind == GGML_ROCKETKV_TOP_K ? top : ggml_rocketkv_indices(ctx, top, 3, n + 3);
         }
+        if (kind == GGML_ROCKETKV_GATHER) {
+            auto * keys = ggml_new_tensor_3d(ctx, type, 128, 2, n);
+            auto * values = ggml_new_tensor_3d(ctx, type, 128, 2, n);
+            sort_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 2);
+            auto * ids = ggml_rocketkv_top_k(ctx, sort_input, std::min(17, n));
+            return ggml_rocketkv_gather(ctx, ggml_permute(ctx, keys, 0, 2, 1, 3),
+                ggml_permute(ctx, values, 0, 2, 1, 3), ids);
+        }
+        if (kind == GGML_ROCKETKV_EXPAND_PAGES) {
+            sort_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 2);
+            live = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            return ggml_rocketkv_page_top_k(ctx, sort_input, live, 3, std::min(17, n));
+        }
         auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 6, 1);
         auto * sums = ggml_rocketkv_query(ctx, q, 2);
         if (kind == GGML_ROCKETKV_QUERY) {
@@ -6847,7 +6860,7 @@ struct test_rocketkv : public test_case {
         if (sort_input) {
             std::vector<float> data(ggml_nelements(sort_input));
             for (size_t i = 0; i < data.size(); ++i) {
-                data[i] = int(i % 7) - 3;
+                data[i] = kind == GGML_ROCKETKV_EXPAND_PAGES ? float((i % n)/3 % 7) : int(i % 7) - 3;
             }
             ggml_backend_tensor_set(sort_input, data.data(), 0, ggml_nbytes(sort_input));
         }
@@ -9285,13 +9298,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
-    for (int kind = GGML_ROCKETKV_REDUCE; kind <= GGML_ROCKETKV_SCORES; ++kind) {
+    for (int kind = GGML_ROCKETKV_REDUCE; kind <= GGML_ROCKETKV_EXPAND_PAGES; ++kind) {
         for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             test_cases.emplace_back(new test_rocketkv(kind, type));
         }
     }
-    for (int n : {1, 17, 128, 1025, 8192}) {
+    for (int n : {1, 17, 128, 512, 513, 1025, 4095, 4096, 4097, 8192, 8193, 16384, 16385, 32768}) {
         test_cases.emplace_back(new test_rocketkv(GGML_ROCKETKV_TOP_K, GGML_TYPE_F32, n));
+    }
+    for (int n : {1, 257, 2048}) {
+        for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_rocketkv(GGML_ROCKETKV_SCORES, type, n));
+        }
     }
 
     // unary ops

@@ -541,7 +541,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
-    const bool profiled = ggml_metal_encoder_rocketkv_profile_begin(ctx->enc, ctx->dev, ctx->node(idx)->name);
+    const bool profiled = ggml_metal_encoder_rocketkv_profile_begin(ctx->enc, ctx->dev, ctx->node(idx));
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -5836,13 +5836,24 @@ int ggml_metal_op_opt_step_sgd(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static int ggml_metal_rocketkv_sort_block(const ggml_tensor * op) {
+    return op->src[0]->ne[0] > 512 && op->ne[0] <= 256 ? 256 : 8192;
+}
+
+size_t ggml_metal_op_rocketkv_extra(const ggml_tensor * op) {
+    if (op->op_params[0] == GGML_ROCKETKV_TOP_K && op->src[0]->ne[0] > ggml_metal_rocketkv_sort_block(op)) {
+        return 2*sizeof(int32_t)*ggml_nelements(op->src[0]);
+    }
+    return 0;
+}
+
 int ggml_metal_op_rocketkv(ggml_metal_op_t ctx, int idx) {
     const auto * op = ctx->node(idx);
     const auto * a = op->src[0];
     const auto * b = op->src[1];
     const auto * c = op->src[2];
     const int kind = op->op_params[0];
-    const bool f16 = kind == GGML_ROCKETKV_METADATA ? op->type == GGML_TYPE_F16 :
+    const bool f16 = kind == GGML_ROCKETKV_METADATA || kind == GGML_ROCKETKV_GATHER ? op->type == GGML_TYPE_F16 :
                     kind == GGML_ROCKETKV_SCORES && b->type == GGML_TYPE_F16;
     ggml_metal_kargs_rocketkv args = {
         op->op_params[1], op->op_params[2], f16,
@@ -5852,10 +5863,16 @@ int ggml_metal_op_rocketkv(ggml_metal_op_t ctx, int idx) {
         c ? int32_t(c->ne[0]) : 0,
         a->nb[0], a->nb[1], a->nb[2],
     };
-    const char * names[] = {"reduce", "top_k", "indices", "metadata", "query", "scores"};
-    GGML_ASSERT(kind >= 0 && kind < 6);
+    const char * names[] = {"reduce", "top_k", "indices", "metadata", "query", "scores", "gather", "expand_pages"};
+    GGML_ASSERT(kind >= 0 && kind < 8);
+    const size_t vector_bytes = 4*ggml_type_size(a->type);
+    const bool gather4 = kind == GGML_ROCKETKV_GATHER && args.n0 % 4 == 0 &&
+        a->nb[1] % vector_bytes == 0 && a->nb[2] % vector_bytes == 0 &&
+        ggml_metal_get_buffer_id(a).offs % vector_bytes == 0 &&
+        ggml_metal_get_buffer_id(b).offs % vector_bytes == 0 &&
+        ggml_metal_get_buffer_id(op).offs % vector_bytes == 0;
     char name[64];
-    snprintf(name, sizeof(name), "kernel_rocketkv_%s", names[kind]);
+    snprintf(name, sizeof(name), "kernel_rocketkv_%s", gather4 ? "gather4" : names[kind]);
     auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
     if (!pipeline.pipeline) {
         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
@@ -5870,16 +5887,51 @@ int ggml_metal_op_rocketkv(ggml_metal_op_t ctx, int idx) {
     int count = 0;
     switch (kind) {
         case GGML_ROCKETKV_TOP_K: {
+            const int block = ggml_metal_rocketkv_sort_block(op);
             int padded = 1;
-            while (padded < args.a0) {
+            while (padded < std::min(args.a0, block)) {
                 padded *= 2;
             }
             ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(padded*sizeof(int32_t), 16), 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, args.n1, 1, 1, std::min(256, padded), 1, 1);
+            if (args.a0 <= block) {
+                ggml_metal_encoder_dispatch_threadgroups(enc, args.n1, 1, 1, std::min(256, padded), 1, 1);
+                return 1;
+            }
+            const auto output = ggml_metal_get_buffer_id(op);
+            auto sorted = output;
+            sorted.offs += ggml_nbytes(op);
+            auto scratch = sorted;
+            scratch.offs += sizeof(int32_t)*ggml_nelements(a);
+            args.p1 = padded;
+            args.n0 = args.a0;
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, sorted, 6);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (args.a0 + padded - 1)/padded, args.n1, 1, 256, 1, 1);
+
+            const char * merge_name = "kernel_rocketkv_top_k_merge";
+            auto merge = ggml_metal_library_get_pipeline(ctx->lib, merge_name);
+            if (!merge.pipeline) {
+                merge = ggml_metal_library_compile_pipeline(ctx->lib, merge_name, merge_name, nullptr);
+            }
+            for (int len = padded; len < args.a0; len *= 2) {
+                ggml_metal_op_concurrency_reset(ctx);
+                const bool last = 2*len >= args.a0;
+                args.p1 = len;
+                args.n0 = last ? op->ne[0] : args.a0;
+                ggml_metal_encoder_set_pipeline(enc, merge);
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer(enc, sorted, 2);
+                ggml_metal_encoder_set_buffer(enc, last ? output : scratch, 6);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (args.a0 + 255)/256, args.n1, 1, 256, 1, 1);
+                std::swap(sorted, scratch);
+            }
             return 1;
         }
         case GGML_ROCKETKV_INDICES:
             ggml_metal_encoder_dispatch_threadgroups(enc, (args.n0 + 255)/256, args.n1, 1, 256, 1, 1);
+            return 1;
+        case GGML_ROCKETKV_EXPAND_PAGES:
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.n1, 1, 1, 256, 1, 1);
             return 1;
         case GGML_ROCKETKV_REDUCE:
             count = args.n0*args.n1;
@@ -5892,6 +5944,9 @@ int ggml_metal_op_rocketkv(ggml_metal_op_t ctx, int idx) {
             break;
         case GGML_ROCKETKV_SCORES:
             count = args.b0*args.a1;
+            break;
+        case GGML_ROCKETKV_GATHER:
+            count = 2*args.n0*args.n1*args.n2/(gather4 ? 4 : 1);
             break;
     }
     ggml_metal_encoder_dispatch_threadgroups(enc, (count + 255)/256, 1, 1, 256, 1, 1);

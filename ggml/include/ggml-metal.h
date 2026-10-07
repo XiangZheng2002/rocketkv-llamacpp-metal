@@ -69,6 +69,8 @@ struct ggml_metal_rocketkv_profile {
 // Diagnostic pass timestamps. These calls synchronize only at the request boundaries.
 // Profiling splits encoders and disables fusion; do not use its wall time for speed claims.
 GGML_BACKEND_API bool ggml_backend_metal_rocketkv_profile_begin(ggml_backend_t backend);
+// Capture FLASH_ATTN_EXT in the attention entry; start after prefill for decode-only timing.
+GGML_BACKEND_API bool ggml_backend_metal_rocketkv_profile_begin_dense(ggml_backend_t backend);
 GGML_BACKEND_API bool ggml_backend_metal_rocketkv_profile_end(ggml_backend_t backend, struct ggml_metal_rocketkv_profile * result);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
